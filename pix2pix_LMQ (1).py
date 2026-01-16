@@ -17,13 +17,12 @@ import pandas as pd
 
 # https://github.com/affinelayer/pix2pix-tensorflow
 
-train_input_dir = "../train_input_2d"  # 训练集输入
-train_output_dir = "../train_output_2d"  # 训练集输出
+train_input_dir = "../train_input"  # 训练集输入
+train_output_dir = "../train_output"  # 训练集输出
 
-test_input_dir = "E:\lmq\\train_test\R0330\\test_input"  # 测试集输入
-test_output_dir = "E:\lmq\\train_test\R0330test_output"  # 测试集的输出
-checkpoint = "E:\lmq\\train_test\R0330\\train_output"
-
+test_input_dir = "../test_output"  # 测试集输入
+test_output_dir = "../test_output"  # 测试集的输出
+checkpoint = "../train_output"
 seed = None
 max_steps = None  # number of training steps (0 to disable)
 max_epochs = 300  # number of training epochs
@@ -717,4 +716,5 @@ def test():
 
 if __name__ == '__main__':
     # test()
+
     train()
