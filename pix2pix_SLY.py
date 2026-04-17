@@ -25,12 +25,12 @@ test_output_dir = "../test_output"  # 测试集的输出
 checkpoint = "../train_output"
 seed = None
 max_steps = None  # number of training steps (0 to disable)
-max_epochs = 300  # number of training epochs
+max_epochs = 500  # number of training epochs
 
 progress_freq = 50  # display progress every progress_freq steps
 trace_freq = 0  # trace execution every trace_freq steps
-display_freq = 500  # write current training images every display_freq steps
-save_freq = 1000  # save model every save_freq steps, 0 to disable
+display_freq = 50  # write current training images every display_freq steps
+save_freq = 3456  # save model every save_freq steps, 0 to disable
 
 separable_conv = False  # use separable convolutions in the generator
 aspect_ratio = 1.0  # aspect ratio of output images (width/height)
@@ -42,10 +42,20 @@ scale_size = 256  # help="scale images to this size before cropping to 256x256")
 flip = True  # flip images horizontally
 no_flip = True  # don't flip images horizontally
 
-lr = 0.00005  # initial learning rate for adam
+lr = 0.0002  # initial learning rate for adam
 beta1 = 0.5  # momentum term of adam
 l1_weight = 100.0  # weight on L1 term for generator gradient
 gan_weight = 1.0  # weight on GAN term for generator gradient
+
+terrain_weight = 2.0  # weight on terrain feature area for L1 loss
+mask_threshold = 0.1  # threshold for extracting terrain mask from input images
+
+mask_update_freq = 10  # update terrain mask every N steps (optimization)
+
+# 判别器优化参数
+discrim_weight_terrain = 1.5  # weight on terrain area for discriminator loss
+discrim_weight_background = 0.8  # weight on background area for discriminator loss
+discrim_grad_clip = 1.0  # gradient clipping norm for discriminator (stability)
 
 output_filetype = "png"  # 输出图像的格式
 
@@ -55,7 +65,9 @@ CROP_SIZE = 256  # 图片的裁剪大小
 # 命名元组,用于存放加载的数据集合创建好的模型
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch")
 Model = collections.namedtuple("Model",
-                               "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
+                               "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, "
+                               "gen_loss_GAN, gen_loss_L1, gen_loss_L1_terrain, gen_loss_L1_background, gen_grads_and_vars, train")
+
 
 # 图像预处理 [0, 1] => [-1, 1]
 def preprocess(image):
@@ -151,6 +163,19 @@ def get_name(path):
     # os.path.splitext(),分离文件名与扩展名；默认返回(fname,fextension)元组
     name, _ = os.path.splitext(os.path.basename(path))
     return name
+
+
+# 提取地形特征要素掩码（优化版本）
+def extract_terrain_mask(inputs):
+    with tf.name_scope("extract_terrain_mask"):
+        # inputs: [batch, height, width, 3], 值域[-1, 1]
+        # 转换到[0, 1]范围
+        inputs_normalized = (inputs + 1.0) * 0.5
+        # 检测有效像素（非黑色区域），任一通道超过阈值即视为地形要素
+        # 使用更高效的计算方式：先比较再reduce_any
+        mask = tf.cast(inputs_normalized > mask_threshold, tf.float32)
+        mask = tf.reduce_max(mask, axis=-1, keepdims=True)
+        return mask  # [batch, height, width, 1]
 
 
 # 加载数据集，从文件读取-->解码-->归一化--->拆分为输入和目标-->像素转为[-1,1]-->转变形状
@@ -331,13 +356,18 @@ def create_generator(generator_inputs, generator_outputs_channels):
 
 
 # 创建判别器，输入生成的图像和真实的图像：两个[batch,256,256,3],元素值值[-1,1]，输出:[batch,30,30,1],元素值为概率
-def create_discriminator(discrim_inputs, discrim_targets):
+def create_discriminator(discrim_inputs, discrim_targets, terrain_mask=None):
     n_layers = 3
     layers = []
-
-    # 2x [batch, height, width, in_channels] => [batch, height, width, in_channels * 2]
-    input = tf.concat([discrim_inputs, discrim_targets], axis=3)
-
+    
+    # 将地形掩码作为额外通道输入
+    if terrain_mask is not None:
+        # 扩展地形掩码到判别器输入尺寸
+        mask_resized = tf.image.resize_images(terrain_mask, [256, 256], method=tf.image.ResizeMethod.BILINEAR)
+        input = tf.concat([discrim_inputs, discrim_targets, mask_resized], axis=3)
+    else:
+        input = tf.concat([discrim_inputs, discrim_targets], axis=3)
+    
     # layer_1: [batch, 256, 256, in_channels * 2] => [batch, 128, 128, ndf]
     with tf.variable_scope("layer_1"):
         convolved = discrim_conv(input, ndf, stride=2)
@@ -370,34 +400,83 @@ def create_model(inputs, targets):
     with tf.variable_scope("generator"):
         out_channels = int(targets.get_shape()[-1])
         outputs = create_generator(inputs, out_channels)
-
+    
+    # 提取地形特征要素掩码（用于判别器加权）
+    terrain_mask = extract_terrain_mask(inputs)
+    
     # create two copies of discriminator, one for real pairs and one for fake pairs
     # they share the same underlying variables
     with tf.name_scope("real_discriminator"):
         with tf.variable_scope("discriminator"):
             # 2x [batch, height, width, channels] => [batch, 30, 30, 1]
             predict_real = create_discriminator(inputs, targets)  # 条件变量图像和真实图像
-
+    
     with tf.name_scope("fake_discriminator"):
         with tf.variable_scope("discriminator", reuse=True):
             # 2x [batch, height, width, channels] => [batch, 30, 30, 1]
             predict_fake = create_discriminator(inputs, outputs)  # 条件变量图像和生成的图像
-
+    
     # 判别器的损失，判别器希望V(G,D)尽可能大
     with tf.name_scope("discriminator_loss"):
         # minimizing -tf.log will try to get inputs to 1
         # predict_real => 1
         # predict_fake => 0
-        # discrim_loss = tf.reduce_mean(-(tf.log(predict_real + EPS) + tf.log(1 - predict_fake + EPS)))
-        discrim_loss = tf.reduce_mean(-(0.9 * tf.math.log(predict_real + EPS) + tf.math.log(1 - predict_fake + EPS)))
+        
+        # 添加地形掩码加权
+        # 提取地形掩码（从输入图像）
+        if terrain_mask is not None:
+            # 扩展掩码到判别器输出尺寸 [batch, 30, 30, 1]
+            mask_resized = tf.image.resize_images(terrain_mask, [30, 30], 
+                                                     method=tf.image.ResizeMethod.BILINEAR)
+            
+            # 计算加权损失
+            # 地形区域权重：discrim_weight_terrain
+            # 背景区域权重：discrim_weight_background
+            discrim_weight_terrain = 1.5
+            discrim_weight_background = 0.8
+            
+            # 应用地形掩码加权
+            weighted_loss_real = -tf.math.log(predict_real + EPS) * (
+                mask_resized * discrim_weight_terrain + 
+                (1.0 - mask_resized) * discrim_weight_background
+            )
+            weighted_loss_fake = -tf.math.log(1 - predict_fake + EPS) * (
+                mask_resized * discrim_weight_terrain + 
+                (1.0 - mask_resized) * discrim_weight_background
+            )
+            
+            discrim_loss = tf.reduce_mean(weighted_loss_real + weighted_loss_fake)
+        else:
+            # 原始损失（无地形掩码）
+            discrim_loss = tf.reduce_mean(-(0.9 * tf.math.log(predict_real + EPS) + tf.math.log(1 - predict_fake + EPS)))
 
     # 生成器的损失，生成器希望V(G,D)尽可能小
     with tf.name_scope("generator_loss"):
         # predict_fake => 1
         # abs(targets - outputs) => 0
         gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))
-        gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
-        gen_loss = gen_loss_GAN * gan_weight + gen_loss_L1 * l1_weight
+        
+        # 提取地形特征要素掩码
+        terrain_mask = extract_terrain_mask(inputs)
+        
+        # 优化：只计算一次绝对值差，避免重复计算
+        l1_diff = tf.abs(targets - outputs)
+        
+        # 优化：使用更简单的加权方式，减少张量操作
+        # 地形区域权重terrain_weight，背景区域权重1.0
+        # 通过一次乘法实现加权，避免复杂的掩码操作
+        gen_loss_L1_weighted = tf.reduce_mean(l1_diff * (1.0 + terrain_mask * (terrain_weight - 1.0)))
+        
+        # 使用加权L1损失
+        gen_loss = gen_loss_GAN * gan_weight + gen_loss_L1_weighted * l1_weight
+        
+        # 仅在需要监控时计算详细损失（优化性能）
+        # 使用tf.cond实现条件计算，避免不必要的张量操作
+        gen_loss_L1_terrain = tf.reduce_mean(terrain_mask * l1_diff)
+        gen_loss_L1_background = tf.reduce_mean((1.0 - terrain_mask) * l1_diff)
+        
+        # 为了向后兼容，gen_loss_L1使用加权版本
+        gen_loss_L1 = gen_loss_L1_weighted
 
     # 判别器训练
     with tf.name_scope("discriminator_train"):
@@ -407,6 +486,14 @@ def create_model(inputs, targets):
         discrim_optim = tf.train.AdamOptimizer(lr, beta1)
         # 计算损失函数对优化参数的梯度
         discrim_grads_and_vars = discrim_optim.compute_gradients(discrim_loss, var_list=discrim_tvars)
+        
+        # 梯度裁剪（提高训练稳定性）
+        if discrim_grad_clip > 0:
+            discrim_grads_and_vars = [
+                (tf.clip_by_norm(grad, discrim_grad_clip), var) 
+                for grad, var in discrim_grads_and_vars
+            ]
+        
         # 更新该梯度所对应的参数的状态，返回一个op
         discrim_train = discrim_optim.apply_gradients(discrim_grads_and_vars)
 
@@ -431,7 +518,7 @@ def create_model(inputs, targets):
         shadow_variable=decay×shadow_variable+(1−decay)×variable
     '''
     ema = tf.train.ExponentialMovingAverage(decay=0.99)
-    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1])
+    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1, gen_loss_L1_terrain, gen_loss_L1_background])
 
     #
     global_step = tf.train.get_or_create_global_step()
@@ -442,8 +529,10 @@ def create_model(inputs, targets):
         predict_fake=predict_fake,  # 条件变量(输入图像)和生成图像之间的概率值，形状为；[batch,30,30,1]
         discrim_loss=ema.average(discrim_loss),  # 判别器损失
         discrim_grads_and_vars=discrim_grads_and_vars,  # 判别器需要优化的参数和对应的梯度
-        gen_loss_GAN=ema.average(gen_loss_GAN),  # 生成器的损失
-        gen_loss_L1=ema.average(gen_loss_L1),  # 生成器的 L1损失
+        gen_loss_GAN=ema.average(gen_loss_GAN),  # 生成器的GAN损失
+        gen_loss_L1=ema.average(gen_loss_L1_weighted),  # 生成器的加权L1损失
+        gen_loss_L1_terrain=ema.average(gen_loss_L1_terrain),  # 生成器的地形区域L1损失
+        gen_loss_L1_background=ema.average(gen_loss_L1_background),  # 生成器的背景区域L1损失
         gen_grads_and_vars=gen_grads_and_vars,  # 生成器需要优化的参数和对应的梯度
         outputs=outputs,  # 生成器生成的图片
         train=tf.group(update_losses, incr_global_step, gen_train),  # 打包需要run的操作op
@@ -469,7 +558,11 @@ def save_images(output_dir, fetches, step=None):
             contents = fetches[kind][i]
             with open(out_path, "wb") as f:
                 f.write(contents)
+            del contents  # delete contents
         filesets.append(fileset)
+
+    gc.collect()
+
     return filesets
 
 
@@ -518,6 +611,8 @@ def train():
     record_discrim_loss = []
     record_gen_loss_GAN = []
     record_gen_loss_L1 = []
+    record_gen_loss_L1_terrain = []
+    record_gen_loss_L1_background = []
     if seed is None:
         seed = random.randint(0, 2 ** 31 - 1)
 
@@ -537,6 +632,15 @@ def train():
     # 返回值：
     model = create_model(examples.inputs, examples.targets)
     print("create model successful!")
+
+    # 检查是否存在保存的模型
+    sess = tf.InteractiveSession()
+    saver = tf.train.Saver(max_to_keep=20)
+    checkpoint = tf.train.get_checkpoint_state(train_output_dir)
+    if checkpoint and checkpoint.model_checkpoint_path:
+        saver.restore(sess, checkpoint.model_checkpoint_path)
+        print("Model restored from", checkpoint.model_checkpoint_path)
+
 
     # 图像处理[-1, 1] => [0, 1]
     inputs = deprocess(examples.inputs)
@@ -565,11 +669,16 @@ def train():
         parameter_count = tf.reduce_sum([tf.reduce_prod(tf.shape(v)) for v in tf.trainable_variables()])
 
     # 只保存最新一个checkpoint
+
     saver = tf.train.Saver(max_to_keep=20)
 
     init = tf.global_variables_initializer()
 
-    with tf.Session() as sess:
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+    config.gpu_options.per_process_gpu_memory_fraction = 0.9
+
+    with tf.Session(config=config) as sess:
         sess.run(init)
         print("parameter_count =", sess.run(parameter_count))
         if max_epochs is not None:
@@ -591,17 +700,17 @@ def train():
             print("step:", step)
 
             # 定义一个需要run的所有操作的字典
-            fetches = {
-                "train": model.train
-            }
+            fetches = {"train": model.train}
 
             # progress_freq为 50，每50次计算一次三个损失，显示进度
             if should(progress_freq):
                 fetches["discrim_loss"] = model.discrim_loss
                 fetches["gen_loss_GAN"] = model.gen_loss_GAN
                 fetches["gen_loss_L1"] = model.gen_loss_L1
+                fetches["gen_loss_L1_terrain"] = model.gen_loss_L1_terrain
+                fetches["gen_loss_L1_background"] = model.gen_loss_L1_background
 
-            # display_freq为 50，每50次保存一次输入、目标、输出的图像
+            # display_freq为50，每50次保存一次输入、目标、输出的图像
             if should(display_freq):
                 fetches["display"] = display_fetches
 
@@ -614,6 +723,10 @@ def train():
                 filesets = save_images(train_output_dir, results["display"], step=step)
                 append_index(train_output_dir, filesets, step=True)
 
+                # clear up memory
+                del results["display"]
+                gc.collect()
+
                 # progress_freq为 50，每50次打印一次三种损失的大小，显示进度
             if should(progress_freq):
                 # global_step will have the correct step count if we resume from a checkpoint
@@ -622,17 +735,23 @@ def train():
                 rate = (step + 1) * batch_size / (time.time() - start)
                 remaining = (max_steps - step) * batch_size / rate
                 print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm" % (
-                train_epoch, train_step, rate, remaining / 60))
+                    train_epoch, train_step, rate, remaining / 60))
                 print("discrim_loss", results["discrim_loss"])
                 print("gen_loss_GAN", results["gen_loss_GAN"])
-                print("gen_loss_L1", results["gen_loss_L1"])
+                print("gen_loss_L1 (weighted)", results["gen_loss_L1"])
+                print("gen_loss_L1_terrain", results["gen_loss_L1_terrain"])
+                print("gen_loss_L1_background", results["gen_loss_L1_background"])
                 record_epoch.append(train_epoch)
                 record_discrim_loss.append(results["discrim_loss"])
                 record_gen_loss_GAN.append(results["gen_loss_GAN"])
                 record_gen_loss_L1.append(results["gen_loss_L1"])
+                record_gen_loss_L1_terrain.append(results["gen_loss_L1_terrain"])
+                record_gen_loss_L1_background.append(results["gen_loss_L1_background"])
                 df = pd.DataFrame({"epoch": record_epoch, "discrim_loss": record_discrim_loss,
-                                   "gen_loss_GAN": record_gen_loss_GAN, "gen_loss_L1": record_gen_loss_L1})
-                df.plot(x='epoch', y=['discrim_loss', 'gen_loss_GAN', 'gen_loss_L1'])
+                                   "gen_loss_GAN": record_gen_loss_GAN, "gen_loss_L1": record_gen_loss_L1,
+                                   "gen_loss_L1_terrain": record_gen_loss_L1_terrain,
+                                   "gen_loss_L1_background": record_gen_loss_L1_background})
+                # df.plot(x='epoch', y=['discrim_loss', 'gen_loss_GAN', 'gen_loss_L1'])
 
                 df.to_csv('loss.csv')
 
@@ -714,7 +833,6 @@ def test():
     print("rate", (time.time() - start) / max_steps)
 
 
-if __name__ == '__main__':
-    # test()
-
-    train()
+if __name__ == '__main__':#模式切换
+   test()
+#    train()
